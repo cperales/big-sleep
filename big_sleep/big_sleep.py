@@ -4,6 +4,7 @@ import subprocess
 import signal
 import string
 import re
+import gc
 
 from datetime import datetime
 from pathlib import Path
@@ -143,8 +144,8 @@ class Latents(torch.nn.Module):
         class_temperature = 2.
     ):
         super().__init__()
-        self.normu = torch.nn.Parameter(torch.zeros(num_latents, z_dim).normal_(std = 1))
-        self.cls = torch.nn.Parameter(torch.zeros(num_latents, num_classes).normal_(mean = -3.9, std = .3))
+        self.normu = torch.nn.Parameter(torch.zeros(num_latents, z_dim, dtype=torch.float16).normal_(std = 1))
+        self.cls = torch.nn.Parameter(torch.zeros(num_latents, num_classes, dtype=torch.float16).normal_(mean = -3.9, std = .3))
         self.register_buffer('thresh_lat', torch.tensor(1))
 
         assert not exists(max_classes) or max_classes > 0 and max_classes <= num_classes, f'max_classes must be between 0 and {num_classes}'
@@ -216,7 +217,8 @@ class BigSleep(nn.Module):
 
         self.interpolation_settings = {'mode': 'bilinear', 'align_corners': False} if bilinear else {'mode': 'nearest'}
 
-        model_name = 'ViT-B/32' if not larger_clip else 'ViT-L/14'
+        # model_name = 'ViT-B/32' if not larger_clip else 'ViT-L/14'
+        model_name = 'RN50'
         self.perceptor, self.normalize_image = load(model_name, jit = False)
 
         self.model = Model(
@@ -224,7 +226,7 @@ class BigSleep(nn.Module):
             max_classes = max_classes,
             class_temperature = class_temperature,
             ema_decay = ema_decay
-        )
+        ).to(device='cuda').to(dtype=torch.float16)
 
     def reset(self):
         self.model.init_latents()
@@ -349,7 +351,7 @@ class Imagine(nn.Module):
             num_cutouts = num_cutouts,
             center_bias = center_bias,
             larger_clip = larger_clip
-        ).cuda()
+        ).to(device='cuda').to(dtype=torch.float16)
 
         self.model = model
 
@@ -447,9 +449,13 @@ class Imagine(nn.Module):
         total_loss = 0
 
         for _ in range(self.gradient_accumulate_every):
+            gc.collect()
+            torch.cuda.empty_cache()
             out, losses = self.model(self.encoded_texts["max"], self.encoded_texts["min"])
             loss = sum(losses) / self.gradient_accumulate_every
             total_loss += loss
+            gc.collect()
+            torch.cuda.empty_cache()
             loss.backward()
 
         self.optimizer.step()
@@ -482,6 +488,8 @@ class Imagine(nn.Module):
         return out, total_loss
 
     def forward(self):
+        gc.collect()
+        torch.cuda.empty_cache()
         penalizing = ""
         if len(self.text_min) > 0:
             penalizing = f'penalizing "{self.text_min}"'
@@ -489,6 +497,8 @@ class Imagine(nn.Module):
         
         with torch.no_grad():
             self.model(self.encoded_texts["max"][0]) # one warmup step due to issue with CLIP and CUDA
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if self.open_folder:
             open_folder('./')
@@ -500,6 +510,8 @@ class Imagine(nn.Module):
             pbar = trange(self.iterations, desc='   iteration', position=1, leave=True)
             image_pbar.update(0)
             for i in (it for it in pbar if not terminate):
+                gc.collect()
+                torch.cuda.empty_cache()
                 out, loss = self.train_step(epoch, i, image_pbar)
                 pbar.set_description(f'loss: {loss.item():04.2f}')
 

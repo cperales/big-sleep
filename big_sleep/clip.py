@@ -1,10 +1,12 @@
 from collections import OrderedDict
+from textwrap import indent
 from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from pathlib import Path
+import gc
 
 import hashlib
 import os
@@ -119,7 +121,13 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
 
     def patch_device(module):
-        graphs = [module.graph] if hasattr(module, "graph") else []
+        if hasattr(module, "forward"):
+            if hasattr(module, "graph"):
+                graphs = [module.graph]
+            else:
+                graphs = []
+        else:
+            graphs = []
         if hasattr(module, "forward1"):
             graphs.append(module.forward1.graph)
 
@@ -197,16 +205,16 @@ class Bottleneck(nn.Module):
         super().__init__()
 
         # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
-        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False, dtype=torch.float16)
+        self.bn1 = nn.BatchNorm2d(planes, dtype=torch.float16)
 
-        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False, dtype=torch.float16)
+        self.bn2 = nn.BatchNorm2d(planes, dtype=torch.float16)
 
         self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
 
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False, dtype=torch.float16)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion, dtype=torch.float16)
 
         self.relu = nn.ReLU(inplace=True)
         self.downsample = None
@@ -216,49 +224,125 @@ class Bottleneck(nn.Module):
             # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
             self.downsample = nn.Sequential(OrderedDict([
                 ("-1", nn.AvgPool2d(stride)),
-                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
-                ("1", nn.BatchNorm2d(planes * self.expansion))
+                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False, dtype=torch.float16)),
+                ("1", nn.BatchNorm2d(planes * self.expansion, dtype=torch.float16))
             ]))
 
+
     def forward(self, x: torch.Tensor):
-        identity = x
-
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.avgpool(out)
-        out = self.bn3(self.conv3(out))
-
+        print('Bottleneck forward')
         if self.downsample is not None:
             identity = self.downsample(x)
+        else:
+            identity = x
+        print('indentity dtype', identity.dtype)
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
 
+        x_conv1 = self.conv1(x)
+        del x
+        gc.collect()
+        torch.cuda.empty_cache()
+        x_bn1 = self.bn1(x_conv1)
+        del x_conv1
+        gc.collect()
+        torch.cuda.empty_cache()
+        out_1 = self.relu(x_bn1)
+        del x_bn1
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+            
+
+        x_conv2 = self.conv2(out_1)
+        del out_1
+        gc.collect()
+        torch.cuda.empty_cache()
+        x_bn2 = self.bn2(x_conv2)
+        del x_conv2
+        gc.collect()
+        torch.cuda.empty_cache()
+        out_2 = self.relu(x_bn2)
+        del x_bn2
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        out_avg = self.avgpool(out_2)
+        del out_2
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        x_conv3 = self.conv3(out_avg)
+        del out_avg
+        gc.collect()
+        torch.cuda.empty_cache()
+        out = self.bn3(x_conv3)
+        del x_conv3
+        gc.collect()
+        torch.cuda.empty_cache()        
         out += identity
-        out = self.relu(out)
-        return out
+        del identity
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+        print('out dtype', out.dtype)
+        print()
+        return self.relu(out)
 
 
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
+        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim, dtype=torch.float16) / embed_dim ** 0.5)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, dtype=torch.float16)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, dtype=torch.float16)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, dtype=torch.float16)
+        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim, dtype=torch.float16)
         self.num_heads = num_heads
 
     def forward(self, x):
-        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
-            query=x, key=x, value=x,
-            embed_dim_to_check=x.shape[-1],
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+        print('reshape')
+        x_res = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1).to(dtype=torch.float16)  # NCHW -> (HW)NC
+        del x
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('cat')
+        x_cat = torch.cat([x_res.mean(dim=0, keepdim=True, dtype=torch.float16), x_res], dim=0)  # (HW+1)NC
+        del x_res
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('+ embedding')
+        x_cat += self.positional_embedding[:, None, :].to(torch.float16)  # (HW+1)NC
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('Multihead')
+        x_multi, _ = F.multi_head_attention_forward(
+            query=x_cat, key=x_cat, value=x_cat,
+            embed_dim_to_check=x_cat.shape[-1],
             num_heads=self.num_heads,
             q_proj_weight=self.q_proj.weight,
             k_proj_weight=self.k_proj.weight,
             v_proj_weight=self.v_proj.weight,
             in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]).to(dtype=torch.float16),
             bias_k=None,
             bias_v=None,
             add_zero_attn=False,
@@ -269,8 +353,20 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
+        del x_cat
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
 
-        return x[0]
+        print('Select [0]')
+        out = x_multi[0]
+        del x_multi
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        return out
 
 
 class ModifiedResNet(nn.Module):
@@ -287,12 +383,12 @@ class ModifiedResNet(nn.Module):
         self.input_resolution = input_resolution
 
         # the 3-layer stem
-        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(width // 2)
-        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(width // 2)
-        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(width)
+        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False, dtype=torch.float16)
+        self.bn1 = nn.BatchNorm2d(width // 2, dtype=torch.float16)
+        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False, dtype=torch.float16)
+        self.bn2 = nn.BatchNorm2d(width // 2, dtype=torch.float16)
+        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False, dtype=torch.float16)
+        self.bn3 = nn.BatchNorm2d(width, dtype=torch.float16)
         self.avgpool = nn.AvgPool2d(2)
         self.relu = nn.ReLU(inplace=True)
 
@@ -316,21 +412,105 @@ class ModifiedResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        def stem(x):
-            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
-                x = self.relu(bn(conv(x)))
-            x = self.avgpool(x)
-            return x
 
-        x = x.type(self.conv1.weight.dtype)
-        x = stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.attnpool(x)
+        # x = x.type(self.conv1.weight.dtype)
 
-        return x
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('STEM:', x.dtype)
+        print('x.max()', x.max())
+        print('x.max()', x.max())
+        print('x.size', x.size())
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('conv1')
+        x_conv1 = self.conv1(x)
+        del x
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('bn1')
+        x_bn1 = self.bn1(x_conv1)
+        del x_conv1
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('conv2')
+        x_conv2 = self.conv2(x_bn1)
+        del x_bn1
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+        
+        print('bn2')
+        x_bn2 = self.bn2(x_conv2)
+        del x_conv2
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('conv3')
+        x_conv3 = self.conv3(x_bn2)
+        del x_bn2
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('bn3')
+        x_bn3 = self.bn3(x_conv3)
+        del x_conv3
+        gc.collect()
+        torch.cuda.empty_cache()
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+
+        print('avg')
+        x_stem = self.avgpool(x_bn3)
+        del x_bn3
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('Torch CUDA memory reserved', torch.cuda.memory_reserved(0))
+        print('Torch CUDA memory allocated', torch.cuda.memory_allocated(0))
+        print(x_stem.dtype)
+        print('x_stem.max()', x_stem.max())
+        print('x_steam.size', x_stem.size())
+
+        print('Layer 1')
+        x_1 = self.layer1(x_stem)
+        del x_stem
+        torch.cuda.empty_cache()
+
+        print('Layer 2')
+        x_2 = self.layer2(x_1)
+        del x_1
+        torch.cuda.empty_cache()
+
+        print('Layer 3')
+        x_3 = self.layer3(x_2)
+        del x_2
+        torch.cuda.empty_cache()
+
+        print('Layer 4')
+        x_4 = self.layer4(x_3)
+        del x_3
+        torch.cuda.empty_cache()
+
+        print('Attnpool')
+        out = self.attnpool(x_4)
+        del x_4
+        torch.cuda.empty_cache()
+
+
+        return out
 
 
 class LayerNorm(nn.LayerNorm):
@@ -338,7 +518,7 @@ class LayerNorm(nn.LayerNorm):
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
+        ret = super().forward(x.type(torch.float16))
         return ret.type(orig_type)
 
 
@@ -351,14 +531,14 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_head, dtype=torch.float16)
+        self.ln_1 = LayerNorm(d_model, dtype=torch.float16)
         self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("c_fc", nn.Linear(d_model, d_model * 4, dtype=torch.float16)),
             ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
+            ("c_proj", nn.Linear(d_model * 4, d_model, dtype=torch.float16))
         ]))
-        self.ln_2 = LayerNorm(d_model)
+        self.ln_2 = LayerNorm(d_model, dtype=torch.float16)
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
@@ -366,8 +546,22 @@ class ResidualAttentionBlock(nn.Module):
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        out_ln_1 = self.ln_1(x)
+        out_attention = self.attention(out_ln_1)
+        del out_ln_1
+        gc.collect()
+        torch.cuda.empty_cache()
+        x += out_attention
+        del out_attention
+        gc.collect()
+        torch.cuda.empty_cache()
+        out_ln_2 = self.ln_2(x)
+        out_mlp = self.mlp(out_ln_2)
+        del out_ln_2
+        gc.collect()
+        torch.cuda.empty_cache()
+        x += out_mlp
+        del out_mlp
         return x
 
 
@@ -466,26 +660,26 @@ class CLIP(nn.Module):
         )
 
         self.vocab_size = vocab_size
-        self.token_embedding = nn.Embedding(vocab_size, transformer_width)
+        self.token_embedding = nn.Embedding(vocab_size, transformer_width, dtype=torch.float16)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width)
+        self.ln_final = LayerNorm(transformer_width, dtype=torch.float16)
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]))
+        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim, dtype=torch.float16))
+        self.logit_scale = nn.Parameter(torch.ones([], dtype=torch.float16))
 
         self.initialize_parameters()
 
     def initialize_parameters(self):
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        nn.init.normal_(self.positional_embedding, std=0.01)
+        nn.init.normal_(self.token_embedding.weight, std=0.02).to(dtype=torch.float16)
+        nn.init.normal_(self.positional_embedding, std=0.01).to(dtype=torch.float16)
 
         if isinstance(self.visual, ModifiedResNet):
             if self.visual.attnpool is not None:
                 std = self.visual.attnpool.c_proj.in_features ** -0.5
-                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std).to(dtype=torch.float16)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std).to(dtype=torch.float16)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std).to(dtype=torch.float16)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std).to(dtype=torch.float16)
 
             for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
                 for name, param in resnet_block.named_parameters():
@@ -507,30 +701,58 @@ class CLIP(nn.Module):
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.context_length, self.context_length)
+        mask = torch.empty(self.context_length, self.context_length, dtype=torch.float16)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
         return mask
 
     @property
     def dtype(self):
-        return self.visual.conv1.weight.dtype
+        return torch.float16
 
     def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+        image_visual = self.visual(image)
+        del image
+        gc.collect()
+        torch.cuda.empty_cache()
+        return image_visual
 
     def encode_text(self, text):
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        x += self.positional_embedding.type(self.dtype)
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        x_permute = x.permute(1, 0, 2)  # NLD -> LND
+        del x
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        x_transformer = self.transformer(x_permute)
+        del x_permute
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        x = x + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        x_permute = x_transformer.permute(1, 0, 2)  # LND -> NLD
+        del x_transformer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        x_final = self.ln_final(x_permute)
+        del x_permute
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        x = x_final[torch.arange(x_final.shape[0]),
+                    text.argmax(dim=-1)] @ self.text_projection
+        del x_final
+        gc.collect()
+        torch.cuda.empty_cache()
 
         return x
 

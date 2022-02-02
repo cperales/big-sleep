@@ -62,16 +62,16 @@ def resample(input, size, align_corners=True, is_srgb=False):
         kernel_h = lanczos(ramp(dh / h, 3), 3).to(input.device, input.dtype)
         pad_h = (kernel_h.shape[0] - 1) // 2
         input = F.pad(input, (0, 0, pad_h, pad_h), 'reflect')
-        input = F.conv2d(input, kernel_h[None, None, :, None])
+        input = F.conv2d(input, kernel_h[None, None, :, None], dtype=torch.float16)
 
     if dw < w:
         kernel_w = lanczos(ramp(dw / w, 3), 3).to(input.device, input.dtype)
         pad_w = (kernel_w.shape[0] - 1) // 2
-        input = F.pad(input, (pad_w, pad_w, 0, 0), 'reflect')
-        input = F.conv2d(input, kernel_w[None, None, None, :])
+        input = F.pad(input, (pad_w, pad_w, 0, 0), 'reflect', dtype=torch.float16)
+        input = F.conv2d(input, kernel_w[None, None, None, :], dtype=torch.float16)
 
     input = input.view([n, c, h, w])
-    input = F.interpolate(input, size, mode='bicubic', align_corners=align_corners)
+    input = F.interpolate(input, size, mode='bicubic', align_corners=align_corners, dtype=torch.float16)
 
     if is_srgb:
         input = to_nonlinear_srgb(input)

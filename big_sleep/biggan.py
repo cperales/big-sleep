@@ -566,7 +566,7 @@ class BigGAN(nn.Module):
     def __init__(self, config):
         super(BigGAN, self).__init__()
         self.config = config
-        self.embeddings = nn.Linear(config.num_classes, config.z_dim, bias=False)
+        self.embeddings = nn.Linear(config.num_classes, config.z_dim, bias=False, dtype=torch.float16)
         self.generator = Generator(config)
 
     def forward(self, z, class_label, truncation):
