@@ -448,16 +448,18 @@ class Imagine(nn.Module):
     def train_step(self, epoch, i, pbar=None):
         total_loss = 0
         self.model = self.model.to(dtype=torch.float16)
-
-        for _ in range(self.gradient_accumulate_every):
-            out, losses = self.model(self.encoded_texts["max"], self.encoded_texts["min"])
-            if out.isnan().any() or out.isinf().any() or \
-                max([losses[i].isnan().any() for i in range(len(losses))]) or \
-                max([losses[i].isinf().any() for i in range(len(losses))]):
-                print('Things just got out of hands...')
-            loss = sum(losses) / self.gradient_accumulate_every
-            total_loss += loss
-            loss.backward()
+        gc.collect()
+        torch.cuda.empty_cache()
+        with torch.autograd.set_detect_anomaly(True):
+            for _ in range(self.gradient_accumulate_every):
+                out, losses = self.model(self.encoded_texts["max"], self.encoded_texts["min"])
+                if out.isnan().any() or out.isinf().any() or \
+                    max([losses[i].isnan().any() for i in range(len(losses))]) or \
+                    max([losses[i].isinf().any() for i in range(len(losses))]):
+                    print('Things just got out of hands...')
+                loss = sum(losses) / self.gradient_accumulate_every
+                total_loss += loss
+                loss.backward()
         self.model.to(dtype=torch.float32)
         self.optimizer.step()
         self.model.model.latents.update()
