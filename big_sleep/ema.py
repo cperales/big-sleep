@@ -3,6 +3,7 @@
 https://www.zijianhu.com/post/pytorch/ema/ by crowsonkb
 """
 from copy import deepcopy
+from numpy import float16
 
 import torch
 from torch import nn

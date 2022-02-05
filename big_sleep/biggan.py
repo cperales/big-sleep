@@ -1,6 +1,7 @@
 # this code is a copy from huggingface
 # with some minor modifications
 
+from numpy import dtype
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -341,16 +342,16 @@ class SelfAttn(nn.Module):
         super(SelfAttn, self).__init__()
         self.in_channels = in_channels
         self.snconv1x1_theta = snconv2d(in_channels=in_channels, out_channels=in_channels//8,
-                                        kernel_size=1, bias=False, eps=eps)
+                                        kernel_size=1, bias=False, eps=eps, device='cuda', dtype=torch.float16)
         self.snconv1x1_phi = snconv2d(in_channels=in_channels, out_channels=in_channels//8,
-                                      kernel_size=1, bias=False, eps=eps)
+                                      kernel_size=1, bias=False, eps=eps, device='cuda', dtype=torch.float16)
         self.snconv1x1_g = snconv2d(in_channels=in_channels, out_channels=in_channels//2,
-                                    kernel_size=1, bias=False, eps=eps)
+                                    kernel_size=1, bias=False, eps=eps, device='cuda', dtype=torch.float16)
         self.snconv1x1_o_conv = snconv2d(in_channels=in_channels//2, out_channels=in_channels,
-                                         kernel_size=1, bias=False, eps=eps)
+                                         kernel_size=1, bias=False, eps=eps, device='cuda', dtype=torch.float16)
         self.maxpool = nn.MaxPool2d(2, stride=2, padding=0)
         self.softmax  = nn.Softmax(dim=-1)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.zeros(1, device='cuda', dtype=torch.float16))
 
     def forward(self, x):
         _, ch, h, w = x.size()
@@ -390,17 +391,19 @@ class BigGANBatchNorm(nn.Module):
         self.conditional = conditional
 
         # We use pre-computed statistics for n_stats values of truncation between 0 and 1
-        self.register_buffer('running_means', torch.zeros(n_stats, num_features))
-        self.register_buffer('running_vars', torch.ones(n_stats, num_features))
+        self.register_buffer('running_means', torch.zeros(n_stats, num_features, dtype=torch.float16))
+        self.register_buffer('running_vars', torch.ones(n_stats, num_features, dtype=torch.float16))
         self.step_size = 1.0 / (n_stats - 1)
 
         if conditional:
             assert condition_vector_dim is not None
-            self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
-            self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps)
+            self.scale = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps,
+                                  device='cuda', dtype=torch.float16)
+            self.offset = snlinear(in_features=condition_vector_dim, out_features=num_features, bias=False, eps=eps,
+                                   device='cuda', dtype=torch.float16)
         else:
-            self.weight = torch.nn.Parameter(torch.Tensor(num_features))
-            self.bias = torch.nn.Parameter(torch.Tensor(num_features))
+            self.weight = torch.nn.Parameter(torch.rand(num_features, device='cuda', dtype=torch.float16))
+            self.bias = torch.nn.Parameter(torch.rand(num_features, device='cuda', dtype=torch.float16))
 
     def forward(self, x, truncation, condition_vector=None):
         # Retreive pre-computed statistics associated to this truncation
@@ -436,16 +439,16 @@ class GenBlock(nn.Module):
         middle_size = in_size // reduction_factor
 
         self.bn_0 = BigGANBatchNorm(in_size, condition_vector_dim, n_stats=n_stats, eps=eps, conditional=True)
-        self.conv_0 = snconv2d(in_channels=in_size, out_channels=middle_size, kernel_size=1, eps=eps)
+        self.conv_0 = snconv2d(in_channels=in_size, out_channels=middle_size, kernel_size=1, eps=eps).to(dtype=torch.float16)
 
         self.bn_1 = BigGANBatchNorm(middle_size, condition_vector_dim, n_stats=n_stats, eps=eps, conditional=True)
-        self.conv_1 = snconv2d(in_channels=middle_size, out_channels=middle_size, kernel_size=3, padding=1, eps=eps)
+        self.conv_1 = snconv2d(in_channels=middle_size, out_channels=middle_size, kernel_size=3, padding=1, eps=eps).to(dtype=torch.float16)
 
         self.bn_2 = BigGANBatchNorm(middle_size, condition_vector_dim, n_stats=n_stats, eps=eps, conditional=True)
-        self.conv_2 = snconv2d(in_channels=middle_size, out_channels=middle_size, kernel_size=3, padding=1, eps=eps)
+        self.conv_2 = snconv2d(in_channels=middle_size, out_channels=middle_size, kernel_size=3, padding=1, eps=eps).to(dtype=torch.float16)
 
         self.bn_3 = BigGANBatchNorm(middle_size, condition_vector_dim, n_stats=n_stats, eps=eps, conditional=True)
-        self.conv_3 = snconv2d(in_channels=middle_size, out_channels=out_size, kernel_size=1, eps=eps)
+        self.conv_3 = snconv2d(in_channels=middle_size, out_channels=out_size, kernel_size=1, eps=eps).to(dtype=torch.float16)
 
         self.relu = nn.ReLU()
 
@@ -453,22 +456,34 @@ class GenBlock(nn.Module):
         x0 = x
 
         x = self.bn_0(x, truncation, cond_vector)
+        torch.cuda.empty_cache()
         x = self.relu(x)
+        torch.cuda.empty_cache()
         x = self.conv_0(x)
+        torch.cuda.empty_cache()
 
         x = self.bn_1(x, truncation, cond_vector)
+        torch.cuda.empty_cache()
         x = self.relu(x)
+        torch.cuda.empty_cache()
         if self.up_sample:
             x = F.interpolate(x, scale_factor=2, mode='nearest')
         x = self.conv_1(x)
+        torch.cuda.empty_cache()
 
         x = self.bn_2(x, truncation, cond_vector)
+        torch.cuda.empty_cache()
         x = self.relu(x)
+        torch.cuda.empty_cache()
         x = self.conv_2(x)
+        torch.cuda.empty_cache()
 
         x = self.bn_3(x, truncation, cond_vector)
+        torch.cuda.empty_cache()
         x = self.relu(x)
+        torch.cuda.empty_cache()
         x = self.conv_3(x)
+        torch.cuda.empty_cache()
 
         if self.drop_channels:
             new_channels = x0.shape[1] // 2
@@ -477,6 +492,9 @@ class GenBlock(nn.Module):
             x0 = F.interpolate(x0, scale_factor=2, mode='nearest')
 
         out = x + x0
+        del x
+        del x0
+        torch.cuda.empty_cache()
         return out
 
 class Generator(nn.Module):
@@ -487,7 +505,8 @@ class Generator(nn.Module):
         condition_vector_dim = config.z_dim * 2
 
         self.gen_z = snlinear(in_features=condition_vector_dim,
-                              out_features=4 * 4 * 16 * ch, eps=config.eps)
+                              out_features=4 * 4 * 16 * ch, eps=config.eps,
+                              device='cuda', dtype=torch.float16)
 
         layers = []
         for i, layer in enumerate(config.layers):
@@ -503,7 +522,11 @@ class Generator(nn.Module):
 
         self.bn = BigGANBatchNorm(ch, n_stats=config.n_stats, eps=config.eps, conditional=False)
         self.relu = nn.ReLU()
-        self.conv_to_rgb = snconv2d(in_channels=ch, out_channels=ch, kernel_size=3, padding=1, eps=config.eps)
+        self.conv_to_rgb = snconv2d(in_channels=ch,
+                                    out_channels=ch,
+                                    kernel_size=3,
+                                    padding=1,
+                                    eps=config.eps).to(dtype=torch.float16)
         self.tanh = nn.Tanh()
 
     def forward(self, cond_vector, truncation):
@@ -529,6 +552,7 @@ class Generator(nn.Module):
         z = z[:, :3, ...]
         z = self.tanh(z)
         return z
+
 
 class BigGAN(nn.Module):
     """BigGAN Generator."""
@@ -566,7 +590,7 @@ class BigGAN(nn.Module):
     def __init__(self, config):
         super(BigGAN, self).__init__()
         self.config = config
-        self.embeddings = nn.Linear(config.num_classes, config.z_dim, bias=False, dtype=torch.float16)
+        self.embeddings = nn.Linear(config.num_classes, config.z_dim, bias=False, device='cuda', dtype=torch.float16)
         self.generator = Generator(config)
 
     def forward(self, z, class_label, truncation):

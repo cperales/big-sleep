@@ -9,6 +9,7 @@ import gc
 from datetime import datetime
 from pathlib import Path
 import random
+from numpy import dtype
 
 import torch
 import torch.nn.functional as F
@@ -90,13 +91,14 @@ def differentiable_topk(x, k, temperature=1.):
 
     for i in range(k):
         is_last = i == (k - 1)
-        values, indices = (x / temperature).softmax(dim=-1).topk(1, dim=-1)
-        topks = torch.zeros_like(x).scatter_(-1, indices, values)
+        values, indices = (x / temperature).softmax(dim=-1).topk(1, dim=-1).to(dtype=torch.float16)
+        topks = torch.zeros_like(x, dtype=torch.float16).scatter_(-1, indices, values)
         topk_tensors.append(topks)
         if not is_last:
             x = x.scatter(-1, indices, float('-inf'))
 
-    topks = torch.cat(topk_tensors, dim=-1)
+    topks = torch.cat(topk_tensors, dim=-1, dtype=torch.float16)
+    torch.cuda.empty_cache()
     return topks.reshape(n, k, dim).sum(dim = 1)
 
 
@@ -144,8 +146,8 @@ class Latents(torch.nn.Module):
         class_temperature = 2.
     ):
         super().__init__()
-        self.normu = torch.nn.Parameter(torch.zeros(num_latents, z_dim, dtype=torch.float16).normal_(std = 1))
-        self.cls = torch.nn.Parameter(torch.zeros(num_latents, num_classes, dtype=torch.float16).normal_(mean = -3.9, std = .3))
+        self.normu = torch.nn.Parameter(torch.zeros(num_latents, z_dim).normal_(std = 1))
+        self.cls = torch.nn.Parameter(torch.zeros(num_latents, num_classes).normal_(mean = -3.9, std = .3))
         self.register_buffer('thresh_lat', torch.tensor(1))
 
         assert not exists(max_classes) or max_classes > 0 and max_classes <= num_classes, f'max_classes must be between 0 and {num_classes}'
@@ -160,6 +162,7 @@ class Latents(torch.nn.Module):
 
         return self.normu, classes
 
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -170,12 +173,11 @@ class Model(nn.Module):
     ):
         super().__init__()
         assert image_size in (128, 256, 512), 'image size must be one of 128, 256, or 512'
-        self.biggan = BigGAN.from_pretrained(f'biggan-deep-{image_size}')
+        self.biggan = BigGAN.from_pretrained(f'biggan-deep-{image_size}').to(device='cuda')
         self.max_classes = max_classes
         self.class_temperature = class_temperature
-        self.ema_decay\
-            = ema_decay
-
+        self.ema_decay = ema_decay
+        self.biggan.eval()
         self.init_latents()
 
     def init_latents(self):
@@ -185,11 +187,11 @@ class Model(nn.Module):
             z_dim = self.biggan.config.z_dim,
             max_classes = self.max_classes,
             class_temperature = self.class_temperature
-        )
-        self.latents = EMA(latents, self.ema_decay)
+        ).to(dtype=torch.float16).to(device='cuda')
+        self.latents = EMA(latents, self.ema_decay).to(dtype=torch.float16).to(device='cuda')
 
     def forward(self):
-        self.biggan.eval()
+        
         out = self.biggan(*self.latents(), 1)
         return (out + 1) / 2
 
@@ -218,7 +220,7 @@ class BigSleep(nn.Module):
         self.interpolation_settings = {'mode': 'bilinear', 'align_corners': False} if bilinear else {'mode': 'nearest'}
 
         # model_name = 'ViT-B/32' if not larger_clip else 'ViT-L/14'
-        model_name = 'RN50'
+        model_name = 'RN50'  #'RN50'
         self.perceptor, self.normalize_image = load(model_name, jit = False)
 
         self.model = Model(
@@ -226,7 +228,7 @@ class BigSleep(nn.Module):
             max_classes = max_classes,
             class_temperature = class_temperature,
             ema_decay = ema_decay
-        ).to(device='cuda').to(dtype=torch.float16)
+        )
 
     def reset(self):
         self.model.init_latents()
@@ -341,7 +343,7 @@ class Imagine(nn.Module):
         self.epochs = epochs
         self.iterations = iterations
 
-        model = BigSleep(
+        self.model = BigSleep(
             image_size = image_size,
             bilinear = bilinear,
             max_classes = max_classes,
@@ -351,12 +353,10 @@ class Imagine(nn.Module):
             num_cutouts = num_cutouts,
             center_bias = center_bias,
             larger_clip = larger_clip
-        ).to(device='cuda').to(dtype=torch.float16)
-
-        self.model = model
+        ).to(device='cuda')
 
         self.lr = lr
-        self.optimizer = Adam(model.model.latents.model.parameters(), lr)
+        self.optimizer = Adam(self.model.model.latents.model.parameters(), lr)
         self.gradient_accumulate_every = gradient_accumulate_every
         self.save_every = save_every
 
@@ -447,17 +447,18 @@ class Imagine(nn.Module):
 
     def train_step(self, epoch, i, pbar=None):
         total_loss = 0
+        self.model = self.model.to(dtype=torch.float16)
 
         for _ in range(self.gradient_accumulate_every):
-            gc.collect()
-            torch.cuda.empty_cache()
             out, losses = self.model(self.encoded_texts["max"], self.encoded_texts["min"])
+            if out.isnan().any() or out.isinf().any() or \
+                max([losses[i].isnan().any() for i in range(len(losses))]) or \
+                max([losses[i].isinf().any() for i in range(len(losses))]):
+                print('Things just got out of hands...')
             loss = sum(losses) / self.gradient_accumulate_every
             total_loss += loss
-            gc.collect()
-            torch.cuda.empty_cache()
             loss.backward()
-
+        self.model.to(dtype=torch.float32)
         self.optimizer.step()
         self.model.model.latents.update()
         self.optimizer.zero_grad()
