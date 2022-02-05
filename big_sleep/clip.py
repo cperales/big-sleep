@@ -433,13 +433,13 @@ class ModifiedResNet(nn.Module):
         return out
 
 
-class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16."""
+# class LayerNorm(nn.LayerNorm):
+#     """Subclass torch's LayerNorm to handle fp16."""
 
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        ret = super().forward(x.type(torch.float16))
-        return ret.type(orig_type)
+#     def forward(self, x: torch.Tensor):
+#         orig_type = x.dtype
+#         ret = super().forward(x.type(torch.float32))
+#         return ret.type(orig_type)
 
 
 class QuickGELU(nn.Module):
@@ -452,13 +452,15 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head, dtype=torch.float16)
-        self.ln_1 = LayerNorm(d_model, dtype=torch.float16)
+        # self.ln_1 = LayerNorm(d_model, dtype=torch.float16)
+        self.ln_1 = nn.LayerNorm(d_model, dtype=torch.float16)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4, dtype=torch.float16)),
             ("gelu", QuickGELU()),
             ("c_proj", nn.Linear(d_model * 4, d_model, dtype=torch.float16))
         ]))
-        self.ln_2 = LayerNorm(d_model, dtype=torch.float16)
+        # self.ln_2 = LayerNorm(d_model, dtype=torch.float16)
+        self.ln_2 = nn.LayerNorm(d_model, dtype=torch.float16)
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
@@ -503,11 +505,13 @@ class VisualTransformer(nn.Module):
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
+        # self.ln_pre = LayerNorm(width)
+        self.ln_pre = nn.LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads)
 
-        self.ln_post = LayerNorm(width)
+        # self.ln_post = LayerNorm(width)
+        self.ln_post = nn.LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
@@ -579,7 +583,8 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width, dtype=torch.float16)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width, dtype=torch.float16)
+        # self.ln_final = LayerNorm(transformer_width, dtype=torch.float16)
+        self.ln_final = nn.LayerNorm(transformer_width, dtype=torch.float16)
 
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim, dtype=torch.float16))
         self.logit_scale = nn.Parameter(torch.ones([], dtype=torch.float16))
